@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+
+# Scraped data / local store
+data/
+*.sqlite
+*.sqlite3
+changeset.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
