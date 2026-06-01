@@ -22,6 +22,8 @@ from dataclasses import asdict, dataclass
 
 import httpx
 
+from .ocr import ocr_available, ocr_file
+
 # Item types that can carry a deadline worth surfacing.
 _DEADLINE_TYPES = {"assignment", "quiz", "calendar_event", "announcement",
                    "content_page", "content_file"}
@@ -108,6 +110,33 @@ def _truncate(text: str | None, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + " …[truncated]"
 
 
+def ocr_pass(items: list[dict]) -> int:
+    """Interpreter-side OCR: fill text for image/scanned items from their raw file.
+
+    Mutates items in place — sets `extracted_text` and clears `needs_vision` when OCR
+    yields text. Runs wherever Stage 2 runs (the GPU desktop, eventually). No-op if
+    Tesseract isn't installed or the raw file isn't reachable on this machine. Returns
+    the number of items OCR'd. (Runs each interpret; cache by file hash later for dedup.)
+    """
+    if not ocr_available():
+        return 0
+    from pathlib import Path
+
+    done = 0
+    for it in items:
+        if it.get("body_text") or it.get("extracted_text") or not it.get("needs_vision"):
+            continue
+        ref = it.get("content_ref")
+        if not ref or not Path(ref).exists():
+            continue
+        text = ocr_file(Path(ref))
+        if text:
+            it["extracted_text"] = text
+            it["needs_vision"] = False
+            done += 1
+    return done
+
+
 def render_bundle(course_name: str, items: list[dict]) -> str:
     """Compact, token-bounded rendering of a course's items for the model."""
     lines: list[str] = [f"COURSE: {course_name}", ""]
@@ -144,12 +173,23 @@ def render_bundle(course_name: str, items: list[dict]) -> str:
 
 
 def _parse_model_json(raw: str) -> dict:
-    """Parse the model's JSON, salvaging the outermost object if it's wrapped in prose."""
+    """Parse the model's JSON, salvaging the outermost object if it's wrapped in prose.
+
+    Never raises: a malformed/empty/non-JSON response (e.g. a model that ran out of
+    context and emitted prose) degrades to no model deadlines, so the course still gets
+    its deterministically-seeded structured dates instead of crashing the whole run.
+    """
     try:
         return json.loads(raw)
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        return json.loads(raw[start:end + 1]) if start >= 0 < end else {"deadlines": []}
+    except (json.JSONDecodeError, TypeError):
+        pass
+    start, end = raw.find("{"), raw.rfind("}")
+    if start >= 0 < end and start < end:
+        try:
+            return json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    return {"deadlines": []}
 
 
 def _build_deadlines(
@@ -220,6 +260,7 @@ class Interpreter(ABC):
     def interpret_course(
         self, org_unit_id: int, course_name: str, items: list[dict]
     ) -> list[Deadline]:
+        ocr_pass(items)  # interpreter-side OCR of any scanned/image items
         bundle = render_bundle(course_name, items)
         raw = self._complete(SYSTEM_PROMPT, bundle)
         parsed = _parse_model_json(raw)
@@ -295,6 +336,46 @@ class LocalInterpreter(Interpreter):
         return "".join(parts)
 
 
+class OllamaInterpreter(Interpreter):
+    """Ollama's NATIVE /api/chat backend.
+
+    Reasoning models (Qwen3.x) default to a 'thinking' mode that can consume the entire
+    response as hidden reasoning and return EMPTY content. The OpenAI-compatible /v1
+    endpoint gives no way to turn thinking off, but Ollama's native /api/chat accepts
+    `think: false`. Everything else (bundling, parsing, seeding) is inherited; only the
+    model call differs — so this slots in beside LocalInterpreter per the backend rule.
+    """
+
+    def __init__(self, base_url: str | None = None, model: str | None = None,
+                 timeout: float = 600.0, think: bool = False):
+        url = (base_url or os.environ.get(
+            "LOCAL_LLM_URL", "http://localhost:11434/v1")).rstrip("/")
+        # native API lives at the server root, not under /v1
+        self.root = url[:-3].rstrip("/") if url.endswith("/v1") else url
+        self.model = model or os.environ.get("LOCAL_LLM_MODEL", "qwen3.5:4b-q4_K_M")
+        self.timeout = timeout
+        self.think = think
+
+    def _complete(self, system: str, user: str) -> str:
+        resp = httpx.post(
+            f"{self.root}/api/chat",
+            json={
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                "think": self.think,        # the switch /v1 can't reach
+                "format": "json",           # constrain output to valid JSON
+                "stream": False,
+                "options": {"temperature": 0},
+            },
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        return resp.json().get("message", {}).get("content", "")
+
+
 def _dedupe(deadlines: list[Deadline]) -> list[Deadline]:
     """Collapse duplicates — e.g. a calendar event mirroring an assignment.
 
@@ -356,6 +437,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--url", help="OpenAI-compatible base URL (default Ollama)")
     p.add_argument("--stream", action="store_true",
                    help="stream the model's output live to the terminal")
+    p.add_argument("--backend", choices=["openai", "ollama"],
+                   help="LLM backend (default $LLM_BACKEND or 'openai'). 'ollama' uses "
+                        "the native /api/chat so thinking can be disabled on Qwen3.x")
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
     cfg = load_config()
@@ -368,6 +452,7 @@ def main(argv: list[str] | None = None) -> int:
         total = 0
         for oid in ids:
             items = items_by_course.get(oid, [])
+            ocr_pass(items)  # so token sizing reflects OCR'd text too
             bundle = render_bundle(store.course_name(oid) or str(oid), items)
             total += len(bundle)
             print(f"  [{oid}] {store.course_name(oid) or '':40.40} "
@@ -376,9 +461,15 @@ def main(argv: list[str] | None = None) -> int:
         store.close()
         return 0
 
-    interp = LocalInterpreter(base_url=args.url, model=args.model, stream=args.stream)
-    print(f"Using local model '{interp.model}' at {interp.base_url}"
-          + (" [streaming]" if args.stream else ""))
+    backend = (args.backend or os.environ.get("LLM_BACKEND", "openai")).lower()
+    if backend == "ollama":
+        interp = OllamaInterpreter(base_url=args.url, model=args.model)
+        print(f"Using Ollama model '{interp.model}' at {interp.root}/api/chat "
+              f"(think=off)")
+    else:
+        interp = LocalInterpreter(base_url=args.url, model=args.model, stream=args.stream)
+        print(f"Using local model '{interp.model}' at {interp.base_url}"
+              + (" [streaming]" if args.stream else ""))
     all_dl: list[Deadline] = []
     for oid in ids:
         items = items_by_course.get(oid, [])

@@ -24,11 +24,17 @@ python -m venv .venv
 .venv/bin/python -m brightspace_scraper.interpret --all  # Stage 2: AI -> deadlines
 .venv/bin/python -m brightspace_scraper.report           # human-readable deadlines.md
 
+# optional Stage 3: push deadlines into Google Calendar (pure-httpx OAuth, no Google SDK)
+.venv/bin/python -m brightspace_scraper.calendar_sync auth   # one-time browser consent (needs a real TTY)
+.venv/bin/python -m brightspace_scraper.calendar_sync sync   # deadlines -> "MUN Deadlines" calendar
+
 # useful flags
 ... cli --active | --all-courses | --courses 671215,671225 | --no-content | --full
 ... interpret --dry-run        # build bundles + print token sizes, no model call
 ... interpret --stream         # stream the model's output live to the terminal
 ... report --all               # include past deadlines
+... calendar_sync sync --dry-run   # show the plan, make no Google API calls
+... calendar_sync sync --all       # include past deadlines; --no-prune to never delete
 ```
 
 There is **no automated test suite**. Verify changes by: `python -m py_compile` on changed
@@ -51,12 +57,17 @@ changed content.
 `auth.py` (CAS login at login.mun.ca → session cookies, pure httpx, no browser) →
 `client.py` (cookie'd httpx client; discovers LP/LE API versions; `get_paged` handles
 bookmark paging) → `harvest/*.py` (one collector per type: courses, assignments, quizzes,
-announcements, calendar, content) → `extract.py` (PDF/Word/PPT → text; images & scanned
-PDFs get `needs_vision=True`, never OCR'd here) → `store.py` (SQLite) + `changeset.py`
+announcements, calendar, content) → `extract.py` (PDF/Word/PPT → text; model-free — images
+& scanned PDFs get `needs_vision=True`, NOT OCR'd here; the raw file is preserved via
+`content_ref`) → `store.py` (SQLite) + `changeset.py`
 (SHA-256 per item, diff vs store, emit `changeset.json` of new/changed only).
 
-**Stage 2 — Interpret** (`interpret.py`): feeds each course's items (structured +
-unstructured **together**, so the model can reconcile) to an LLM that returns reconciled
+**Stage 2 — Interpret** (`interpret.py`): an interpreter-side OCR pass (`ocr.py`,
+Tesseract) reads any `needs_vision` items from their preserved raw file — so OCR runs
+wherever Stage 2 runs (the GPU desktop, eventually), not on a thin client; it's a
+graceful no-op if Tesseract is absent, leaving `needs_vision` as the escalation signal
+for a future GPU vision model. Then each course's items (structured + unstructured
+**together**, so the model can reconcile) go to an LLM that returns reconciled
 `Deadline`s → stored in the `deadlines` table → `report.py` renders `deadlines.md`.
 
 ### Key design rules (don't break these)

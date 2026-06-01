@@ -5,3 +5,10 @@ pdfplumber>=0.11
 PyMuPDF>=1.24
 python-docx>=1.1
 python-pptx>=0.6
+# OCR for images / scanned PDFs — runs on the INTERPRETER side (ocr.py), so it's only
+# needed where Stage 2 runs (your GPU desktop, eventually), not on a thin client. Needs
+# the Tesseract *binary* too: Arch `pacman -S tesseract tesseract-data-eng`, Debian/Ubuntu
+# `apt install tesseract-ocr`, Windows installer from github.com/UB-Mannheim/tesseract.
+# Pillow is already pulled in by pdfplumber; pinned here since ocr.py uses it directly.
+pytesseract>=0.3.10
+Pillow>=10.0

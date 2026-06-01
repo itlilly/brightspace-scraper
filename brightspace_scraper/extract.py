@@ -1,8 +1,11 @@
 """Turn downloaded files into plain text.
 
-Text-bearing formats (PDF/Word/PPT/HTML/txt) are extracted to text. Images and
-image-only/scanned PDFs are *not* OCR'd here — they're flagged `needs_vision` so the
-future AI stage (if vision-capable) can handle them. Stage 1 stays model-free.
+Text-bearing formats (PDF/Word/PPT/HTML/txt) are extracted to text here, in Stage 1,
+with no model and no OCR — harvesting stays deterministic and dependency-light. Images
+and image-only/scanned PDFs are *not* read here; they're flagged `needs_vision` and the
+raw file is preserved (the harvester records its path as `content_ref`). The interpreter
+side reads those bytes — OCR first, a vision model later — so that work lives wherever
+Stage 2 runs (e.g. the GPU desktop) and a thin client never needs a Tesseract binary.
 """
 
 from __future__ import annotations
@@ -78,7 +81,11 @@ def _pptx_text(path: Path) -> str | None:
 
 
 def extract_text(path: Path) -> Extracted:
-    """Extract text from a downloaded file based on its extension."""
+    """Extract text from a downloaded file based on its extension.
+
+    Images and text-less (scanned) PDFs return `needs_vision=True` with no text — the
+    interpreter side OCRs/vision-reads them from the preserved raw file.
+    """
     ext = path.suffix.lower()
 
     if ext in _IMAGE_EXTS:
@@ -88,7 +95,7 @@ def extract_text(path: Path) -> Extracted:
 
     if ext == ".pdf":
         text = _pdf_text(path)
-        # A PDF with no extractable text is almost certainly scanned -> vision.
+        # A PDF with no extractable text is almost certainly scanned -> needs_vision.
         return Extracted(text=text, needs_vision=text is None)
     if ext == ".docx":
         return Extracted(text=_docx_text(path))
