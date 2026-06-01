@@ -14,7 +14,8 @@ from .util import parse_iso as _parse
 
 
 def _fmt(dt: _dt.datetime | None) -> str:
-    return dt.strftime("%a %b %d, %Y  %H:%M") if dt else "—"
+    # Stored dates are UTC; show them in local time (matches the "generated" line).
+    return dt.astimezone().strftime("%a %b %d, %Y  %H:%M") if dt else "—"
 
 
 def build_report(db_path, *, include_past: bool = False) -> str:
