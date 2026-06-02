@@ -37,7 +37,12 @@ _PER_ITEM_TEXT_CHARS = 2200
 _HIGH_VALUE_RE = re.compile(r"outline|syllab|assignment|\blab\b|project|problem set|schedule",
                             re.I)
 _HIGH_VALUE_TEXT_CHARS = 9000
-_COURSE_CHAR_BUDGET = 24000
+# Keep the whole bundle within the model's context window. Dense math/code tokenizes at
+# ~3 chars/token, so 24k chars blew past an 8k-token context (prompt + system + output) —
+# the bundle got truncated into garbage and the model emitted prose, not JSON. 16k chars
+# (~5k tokens worst-case) leaves room for the system prompt and the JSON output. High-value
+# items (outline/syllabus) are prioritized, so what's dropped first is lecture-slide noise.
+_COURSE_CHAR_BUDGET = 16000
 
 # Words that signal a document likely carries a deadline (boost into the budget) ...
 _DEADLINE_HINTS = ("due", "deadline", "submit", "submission", "assignment", "lab",
@@ -46,6 +51,20 @@ _DEADLINE_HINTS = ("due", "deadline", "submit", "submission", "assignment", "lab
 # ... and ones that signal pure reference/lecture noise (push out of the budget first).
 _NOISE_HINTS = ("datasheet", "lecture", "slides", "lesson", "notes", "solution",
                 "answer", "tutorial")
+
+# Deterministic backstop for non-deadlines the model sometimes captures anyway: solution/
+# answer postings, lecture recordings, class sessions. Conservative on purpose — we match
+# clearly-material words (not bare "class"/"test"/"quiz") so we never drop a real assessment.
+# Under-filtering beats over-filtering: a stray entry is annoying; deleting a real exam is bad.
+_NOISE_TITLE_RE = re.compile(
+    r"\b(solutions?|soln|answers?|lecture|lesson|recording)\b|_ans[_\d]", re.I)
+
+
+def _is_noise_deadline(title: str | None, dtype: str | None) -> bool:
+    """True if this looks like posted material, not a graded deadline."""
+    if (dtype or "").lower() == "class":   # a type the model invents for lecture sessions
+        return True
+    return bool(_NOISE_TITLE_RE.search(title or ""))
 
 
 def _content_relevance(item: dict) -> int:
@@ -76,8 +95,10 @@ IMPORTANT details:
   a date with no textual basis.
 - Resolve relative dates ("next Friday") only if an anchor date is present; otherwise set
   final_due_date to null and confidence "low".
-- IGNORE non-graded lecture/topic rows, readings, tutorials, and office hours. But DO
-  capture any graded quiz/test/midterm/exam/assignment even if it sits in a schedule.
+- IGNORE non-graded lecture/topic rows, readings, tutorials, and office hours. Also IGNORE
+  solution/answer postings, lecture recordings, and class sessions — a "Quiz 1 Solution",
+  a posted answer key, or a lecture is NOT a deadline. But DO capture any graded
+  quiz/test/midterm/exam/assignment even if it sits in a schedule.
 - Use a clear title: "Quiz 2", "Midterm Exam", "Term Test 1", "Lab 2 Report".
 
 Return ONLY JSON of the form:
@@ -199,8 +220,13 @@ def _build_deadlines(
     safety net, deterministic seeding, and dedup. Shared by every backend."""
     by_id = {it.get("id"): it for it in items}
     results: list[Deadline] = []
+    dropped: list[str] = []
     for d in raw_deadlines:
         src = by_id.get(d.get("item_id"), {})
+        title = d.get("title") or src.get("title") or "(untitled)"
+        if _is_noise_deadline(title, d.get("type")):
+            dropped.append(title)
+            continue
         structured = src.get("structured_due_date")
         final = d.get("final_due_date")
         confidence = d.get("confidence") or "low"
@@ -217,7 +243,7 @@ def _build_deadlines(
         results.append(Deadline(
             org_unit_id=org_unit_id,
             item_id=d.get("item_id"),
-            title=d.get("title") or src.get("title") or "(untitled)",
+            title=title,
             type=d.get("type") or "other",
             final_due_date=final,
             structured_due_date=structured,
@@ -233,7 +259,8 @@ def _build_deadlines(
     for it in items:
         if (it.get("type") in ("assignment", "quiz")
                 and it.get("structured_due_date")
-                and it.get("id") not in present):
+                and it.get("id") not in present
+                and not _is_noise_deadline(it.get("title"), it.get("type"))):
             results.append(Deadline(
                 org_unit_id=org_unit_id,
                 item_id=it.get("id"),
@@ -245,6 +272,9 @@ def _build_deadlines(
                 source_url=it.get("source_url"),
                 reasoning="[seeded] structured due date from Brightspace",
             ))
+    if dropped:
+        print(f"  [filtered {len(dropped)} non-deadline(s): "
+              f"{', '.join(dropped[:5])}{' …' if len(dropped) > 5 else ''}]")
     return _dedupe(results)
 
 

@@ -303,83 +303,111 @@ def _event_id(key: str) -> str:
     return "mun" + enc
 
 
-def _content_hash(d: dict, assumed_time: bool) -> str:
+EVENT_TYPES = {"test", "midterm", "exam"}   # sit-down events → block out the time
+_DEFAULT_BLOCK_MIN = 60                      # assumed exam length when not stated (flagged)
+
+
+@dataclass
+class _Plan:
+    kind: str                     # "allday" (task) or "timed" (blocked-out event)
+    date_str: str                 # YYYY-MM-DD — the intended date (no tz shift)
+    start: _dt.datetime | None    # tz-aware local start, timed only
+    duration_guessed: bool        # timed: the block length was a default guess
+    due_time_str: str | None      # all-day: a known due time to note in the details
+    anchor_utc: _dt.datetime      # for the upcoming/past filter
+
+
+def _plan(d: dict, cfg: Config) -> _Plan:
+    """Decide how a deadline appears: an all-day task, or a blocked-out timed event.
+
+    Sit-down exams (test/midterm/exam) WITH a real clock time get a timed block;
+    everything else is an all-day task (its due time, if any, goes in the details).
+    All-day events use the date string, not a UTC timestamp, so a date-only deadline
+    the model encoded as midnight-UTC (T00:00:00Z) no longer shifts to the prior day.
+    """
+    tz = ZoneInfo(cfg.calendar_timezone)
+    raw = d["final_due_date"]
+    day_str = raw[:10]
+    parsed = parse_iso(raw)
+    # a "real" scheduled time = has a T and isn't a placeholder. The model encodes a
+    # date-only / "due by end of day" deadline as midnight (T00:00:00Z) or end-of-day
+    # (T23:59:59Z); neither is a time you'd block out, so treat both as no-time.
+    placeholder = bool(parsed) and (
+        (parsed.hour == 0 and parsed.minute == 0 and parsed.second == 0)
+        or (parsed.hour == 23 and parsed.minute == 59))
+    has_real_time = bool(parsed) and "T" in raw and not placeholder
+    local = ((parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)).astimezone(tz)
+             if has_real_time else None)
+    is_event = (d.get("type") or "").lower() in EVENT_TYPES
+
+    if is_event and has_real_time:
+        return _Plan("timed", day_str, local, True, None,
+                     local.astimezone(_dt.timezone.utc))
+    # all-day task; anchor at end of that day (local) for the upcoming/past filter
+    y, m, dd = int(day_str[:4]), int(day_str[5:7]), int(day_str[8:10])
+    anchor = _dt.datetime(y, m, dd, 23, 59, tzinfo=tz).astimezone(_dt.timezone.utc)
+    return _Plan("allday", day_str, None, False,
+                 local.strftime("%H:%M") if local else None, anchor)
+
+
+def _content_hash(d: dict, plan: _Plan) -> str:
     basis = "|".join(str(x) for x in (
         d.get("title"), d.get("final_due_date"), d.get("structured_due_date"),
-        d.get("confidence"), d.get("reasoning"), d.get("source_url"), assumed_time,
+        d.get("confidence"), d.get("reasoning"), d.get("source_url"),
+        plan.kind, plan.date_str, plan.start.isoformat() if plan.start else "",
+        plan.duration_guessed, plan.due_time_str,
     ))
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
 
 
-@dataclass
-class _Resolved:
-    start: _dt.datetime          # tz-aware, in the calendar timezone
-    assumed_time: bool           # True when we defaulted a date-only deadline
-
-
-def _resolve_time(raw: str, cfg: Config) -> _Resolved:
-    """Turn a deadline's final_due_date string into a concrete local datetime."""
-    tz = ZoneInfo(cfg.calendar_timezone)
-    has_time = "T" in raw  # ISO-8601 separates date and time with 'T'
-    if has_time:
-        dt = parse_iso(raw)
-        if dt is None:  # malformed — fall back to date-only handling
-            has_time = False
-        else:
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=tz)
-            return _Resolved(start=dt.astimezone(tz), assumed_time=False)
-    # date-only: apply the (configurable) default due time, flagged as assumed
-    day = _dt.date.fromisoformat(raw[:10])
-    hh, mm = (int(x) for x in cfg.default_due_time.split(":"))
-    return _Resolved(
-        start=_dt.datetime(day.year, day.month, day.day, hh, mm, tzinfo=tz),
-        assumed_time=True,
-    )
-
-
 def _build_event(d: dict, course_label: str, cfg: Config) -> tuple[str, str, dict]:
     """Return (stable_key, content_hash, event_body) for a dated deadline."""
-    res = _resolve_time(d["final_due_date"], cfg)
+    plan = _plan(d, cfg)
     key = _stable_key(d)
-    chash = _content_hash(d, res.assumed_time)
+    chash = _content_hash(d, plan)
 
     confidence = (d.get("confidence") or "").lower()
-    low = confidence and confidence != "high"
     title = f"{course_label}: {d.get('title') or 'Deadline'}"
-    if low:
+    if confidence and confidence != "high":
         title = "(?) " + title
-
-    end = res.start + _dt.timedelta(minutes=30)
 
     lines: list[str] = []
     if d.get("reasoning"):
-        lines.append(d["reasoning"])
-        lines.append("")
+        lines += [d["reasoning"], ""]
+    if plan.kind == "timed":
+        lines.append(f"⏱ Time blocked out — duration ASSUMED {_DEFAULT_BLOCK_MIN} min "
+                     f"(a guess; verify the actual length).")
+    elif plan.due_time_str:
+        lines.append(f"All-day task. Due by {plan.due_time_str} {cfg.calendar_timezone}.")
+    else:
+        lines.append("All-day task (no specific time given).")
     lines.append(f"Final due date: {d.get('final_due_date')}")
-    if d.get("structured_due_date") and d.get("structured_due_date") != d.get("final_due_date"):
-        lines.append(f"Brightspace structured date: {d.get('structured_due_date')}")
+    if d.get("structured_due_date") and d["structured_due_date"] != d.get("final_due_date"):
+        lines.append(f"Brightspace structured date: {d['structured_due_date']}")
     if confidence:
         lines.append(f"Confidence: {confidence}")
-    if res.assumed_time:
-        lines.append(f"⏱ Time not specified — defaulted to {cfg.default_due_time} "
-                     f"({cfg.calendar_timezone}).")
     if d.get("source_url"):
         lines.append(f"\nBrightspace: {d['source_url']}")
     lines.append(f"\n— synced by {APP_MARKER}")
 
+    if plan.kind == "timed":
+        end = plan.start + _dt.timedelta(minutes=_DEFAULT_BLOCK_MIN)
+        start_field = {"dateTime": plan.start.isoformat(), "timeZone": cfg.calendar_timezone}
+        end_field = {"dateTime": end.isoformat(), "timeZone": cfg.calendar_timezone}
+        reminders = [{"method": "popup", "minutes": 24 * 60},
+                     {"method": "popup", "minutes": 60}]
+    else:
+        d1 = (_dt.date.fromisoformat(plan.date_str) + _dt.timedelta(days=1)).isoformat()
+        start_field = {"date": plan.date_str}      # all-day: no tz → no day shift
+        end_field = {"date": d1}                    # all-day end is exclusive (next day)
+        reminders = [{"method": "popup", "minutes": 18 * 60}]  # ~evening before
+
     body = {
         "summary": title,
         "description": "\n".join(lines),
-        "start": {"dateTime": res.start.isoformat(), "timeZone": cfg.calendar_timezone},
-        "end": {"dateTime": end.isoformat(), "timeZone": cfg.calendar_timezone},
-        "reminders": {
-            "useDefault": False,
-            "overrides": [
-                {"method": "popup", "minutes": 24 * 60},
-                {"method": "popup", "minutes": 180},
-            ],
-        },
+        "start": start_field,
+        "end": end_field,
+        "reminders": {"useDefault": False, "overrides": reminders},
         "extendedProperties": {
             "private": {"itemKey": key, "hash": chash, "app": APP_MARKER}
         },
@@ -421,8 +449,7 @@ def sync(cfg: Config, *, dry_run: bool = False, prune: bool = True,
         if not d.get("final_due_date"):
             skipped_undated += 1
             continue
-        res = _resolve_time(d["final_due_date"], cfg)
-        if not include_past and res.start.astimezone(_dt.timezone.utc) < now:
+        if not include_past and _plan(d, cfg).anchor_utc < now:
             continue
         label = courses.get(d.get("org_unit_id"), str(d.get("org_unit_id")))
         key, chash, body = _build_event(d, label, cfg)
@@ -432,8 +459,12 @@ def sync(cfg: Config, *, dry_run: bool = False, prune: bool = True,
     if dry_run:
         print(f"[dry-run] {len(desired)} dated deadline(s) would be synced "
               f"({skipped_undated} undated skipped):\n")
-        for _, body in desired.values():
-            print(f"  • {body['start']['dateTime']}  {body['summary']}")
+        for _, body in sorted(desired.values(),
+                               key=lambda x: x[1]["start"].get("dateTime")
+                               or x[1]["start"].get("date")):
+            st = body["start"]
+            when = st.get("dateTime") or f"{st['date']} (all-day)"
+            print(f"  • {when:32}  {body['summary']}")
         print("\n[dry-run] no Google API calls were made.")
         return
 
