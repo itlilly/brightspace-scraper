@@ -515,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
     cfg = load_config()
-    store = Store(cfg.db_path)
+    store = Store(cfg.database_url, cfg.institution)
     ids = _target_courses(store, args)
     items_by_course = store.get_items_for_courses(ids)
     print(f"Interpreting {len(ids)} course(s)...")

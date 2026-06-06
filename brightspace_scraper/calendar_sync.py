@@ -25,7 +25,6 @@ from __future__ import annotations
 import base64
 import datetime as _dt
 import hashlib
-import sqlite3
 from dataclasses import dataclass
 from urllib.parse import urlencode, urlparse, parse_qs
 from zoneinfo import ZoneInfo
@@ -33,6 +32,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from .config import Config, load_config
+from .store import Store
 from .util import parse_iso
 
 try:  # same guard as credentials.py — keyring may have no backend
@@ -94,10 +94,12 @@ def _kc_delete(key: str) -> None:
 class GoogleCalendar:
     """Thin authenticated httpx wrapper over the Calendar v3 REST API."""
 
-    def __init__(self, http: httpx.Client, client_id: str, client_secret: str):
+    def __init__(self, http: httpx.Client, client_id: str, client_secret: str,
+                 refresh_token: str):
         self.http = http
         self.client_id = client_id
         self.client_secret = client_secret
+        self.refresh_token = refresh_token   # per-user (backend) or keychain (CLI)
         self._access_token: str | None = None
 
     # -- authorization (one-time, interactive) -----------------------------
@@ -183,16 +185,15 @@ class GoogleCalendar:
 
     # -- access token (refresh on demand) ----------------------------------
     def _refresh_access_token(self) -> None:
-        refresh = _kc_get(_KC_REFRESH)
-        if not refresh:
+        if not self.refresh_token:
             raise CalendarError(
-                "Not authorized yet. Run:\n"
-                "    python -m brightspace_scraper.calendar_sync auth"
+                "No refresh token. CLI: run `calendar_sync auth`. Backend: the user must "
+                "sign in with Google first."
             )
         resp = self.http.post(
             TOKEN_ENDPOINT,
             data={
-                "refresh_token": refresh,
+                "refresh_token": self.refresh_token,
                 "client_id": self.client_id,
                 "client_secret": self.client_secret,
                 "grant_type": "refresh_token",
@@ -220,23 +221,23 @@ class GoogleCalendar:
         return resp
 
     # -- calendar bootstrap ------------------------------------------------
-    def ensure_calendar(self, timezone: str) -> str:
-        """Return the id of our 'MUN Deadlines' calendar, creating it if needed."""
-        cal_id = _kc_get(_KC_CALENDAR)
-        if cal_id:
-            # Verify it still exists (user may have deleted it).
-            r = self.request("GET", f"/calendars/{cal_id}")
+    def ensure_calendar(self, timezone: str, calendar_id: str | None = None) -> str:
+        """Return the id of our 'MUN Deadlines' calendar, creating it if needed.
+
+        `calendar_id` is the caller's remembered id (keychain for the CLI, the user row
+        for the backend); if it still exists we reuse it. The caller persists the result.
+        """
+        if calendar_id:
+            r = self.request("GET", f"/calendars/{calendar_id}")
             if r.status_code == 200:
-                return cal_id
+                return calendar_id
         resp = self.request(
             "POST", "/calendars",
             json={"summary": CALENDAR_SUMMARY, "timeZone": timezone},
         )
         if resp.status_code not in (200, 201):
             raise CalendarError(f"Could not create calendar: {resp.status_code} {resp.text}")
-        cal_id = resp.json()["id"]
-        _kc_set(_KC_CALENDAR, cal_id)
-        return cal_id
+        return resp.json()["id"]
 
     def list_events(self, calendar_id: str) -> list[dict]:
         """All events on our calendar (paged), with the fields reconcile needs."""
@@ -422,15 +423,12 @@ def _build_event(d: dict, course_label: str, cfg: Config) -> tuple[str, str, dic
 
 
 # --------------------------------------------------------------------------- reconcile
-def _load_deadlines(db_path) -> tuple[list[dict], dict[int, str]]:
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    rows = [dict(r) for r in conn.execute("SELECT * FROM deadlines")]
+def _load_deadlines(store: Store) -> tuple[list[dict], dict[int, str]]:
+    rows = [dict(r) for r in store.deadlines_for_institution()]
     courses = {}
-    for c in conn.execute("SELECT org_unit_id, name, code FROM courses"):
+    for c in store.courses_for_institution():
         # name-first, matching report.py's course_label convention
         courses[c["org_unit_id"]] = c["name"] or c["code"] or str(c["org_unit_id"])
-    conn.close()
     return rows, courses
 
 
@@ -447,14 +445,12 @@ def _event_start(ev: dict, tz: ZoneInfo) -> _dt.datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)
 
 
-def sync(cfg: Config, *, dry_run: bool = False, prune: bool = True,
-         include_past: bool = False) -> None:
-    rows, courses = _load_deadlines(cfg.db_path)
-    now = _dt.datetime.now(_dt.timezone.utc)
-
-    # Build the desired set from dated deadlines (skip undated — they have no event).
-    desired: dict[str, tuple[str, dict]] = {}   # event_id -> (content_hash, body)
-    desired_keys: set[str] = set()
+def _desired_from_deadlines(
+    rows: list[dict], courses: dict[int, str], cfg: Config, *,
+    include_past: bool, now: _dt.datetime,
+) -> tuple[dict[str, tuple[str, dict]], int]:
+    """Map dated deadlines to {event_id: (content_hash, body)}. Returns (desired, skipped)."""
+    desired: dict[str, tuple[str, dict]] = {}
     skipped_undated = 0
     for d in rows:
         if not d.get("final_due_date"):
@@ -465,7 +461,55 @@ def sync(cfg: Config, *, dry_run: bool = False, prune: bool = True,
         label = courses.get(d.get("org_unit_id"), str(d.get("org_unit_id")))
         key, chash, body = _build_event(d, label, cfg)
         desired[_event_id(key)] = (chash, body)
-        desired_keys.add(key)
+    return desired, skipped_undated
+
+
+def _reconcile(
+    gc: GoogleCalendar, cal_id: str, desired: dict[str, tuple[str, dict]], *,
+    prune: bool, now: _dt.datetime, tz: ZoneInfo,
+) -> dict[str, int]:
+    """Idempotently reconcile `desired` against the calendar. Skips unchanged (by hash),
+    upserts the rest, and prunes future orphaned events. Shared by CLI + backend."""
+    existing = gc.list_events(cal_id)
+    existing_hash: dict[str, str] = {}
+    for ev in existing:
+        priv = (ev.get("extendedProperties") or {}).get("private") or {}
+        existing_hash[ev["id"]] = priv.get("hash", "")
+
+    created = updated = unchanged = 0
+    for event_id, (chash, body) in desired.items():
+        if existing_hash.get(event_id) == chash:
+            unchanged += 1
+            continue
+        gc.upsert_event(cal_id, event_id, body)
+        if event_id in existing_hash:
+            updated += 1
+        else:
+            created += 1
+
+    deleted = 0
+    if prune and desired:  # never prune on an empty set (a failed/empty scrape)
+        for ev in existing:
+            if ev["id"] in desired:
+                continue
+            start = _event_start(ev, tz)
+            if start and start >= now:  # only prune future, never history
+                gc.delete_event(cal_id, ev["id"])
+                deleted += 1
+    return {"created": created, "updated": updated, "unchanged": unchanged, "deleted": deleted}
+
+
+def sync(cfg: Config, *, dry_run: bool = False, prune: bool = True,
+         include_past: bool = False) -> None:
+    """CLI / self-host sync: keychain refresh token + Desktop OAuth client, all deadlines."""
+    store = Store(cfg.database_url, cfg.institution)
+    try:
+        rows, courses = _load_deadlines(store)
+    finally:
+        store.close()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    desired, skipped_undated = _desired_from_deadlines(
+        rows, courses, cfg, include_past=include_past, now=now)
 
     if dry_run:
         print(f"[dry-run] {len(desired)} dated deadline(s) would be synced "
@@ -483,46 +527,57 @@ def sync(cfg: Config, *, dry_run: bool = False, prune: bool = True,
         raise CalendarError(
             "GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are not set (see .env.example)."
         )
+    refresh = _kc_get(_KC_REFRESH)
+    if not refresh:
+        raise CalendarError(
+            "Not authorized yet. Run:\n    python -m brightspace_scraper.calendar_sync auth"
+        )
+    if prune and not desired:
+        print("⚠ refusing to prune: 0 deadlines to sync (likely an empty/failed scrape). "
+              "Run `interpret` first, or pass --no-prune knowingly.")
 
     with httpx.Client(timeout=30.0) as http:
-        gc = GoogleCalendar(http, cfg.google_client_id, cfg.google_client_secret)
-        cal_id = gc.ensure_calendar(cfg.calendar_timezone)
-        existing = gc.list_events(cal_id)
-
-        # Map existing events by their stored hash so we can skip unchanged ones.
-        existing_hash: dict[str, str] = {}
-        for ev in existing:
-            priv = (ev.get("extendedProperties") or {}).get("private") or {}
-            existing_hash[ev["id"]] = priv.get("hash", "")
-
-        created = updated = unchanged = 0
-        for event_id, (chash, body) in desired.items():
-            if existing_hash.get(event_id) == chash:
-                unchanged += 1
-                continue
-            gc.upsert_event(cal_id, event_id, body)
-            if event_id in existing_hash:
-                updated += 1
-            else:
-                created += 1
-
-        deleted = 0
-        if prune:
-            if not desired:
-                print("⚠ refusing to prune: 0 deadlines to sync (likely an empty/failed "
-                      "scrape). Run `interpret` first, or pass --no-prune knowingly.")
-            else:
-                for ev in existing:
-                    if ev["id"] in desired:
-                        continue
-                    start = _event_start(ev, ZoneInfo(cfg.calendar_timezone))
-                    if start and start >= now:  # only prune future, never history
-                        gc.delete_event(cal_id, ev["id"])
-                        deleted += 1
+        gc = GoogleCalendar(http, cfg.google_client_id, cfg.google_client_secret, refresh)
+        cal_id = gc.ensure_calendar(cfg.calendar_timezone, _kc_get(_KC_CALENDAR))
+        if cal_id != _kc_get(_KC_CALENDAR):
+            _kc_set(_KC_CALENDAR, cal_id)
+        c = _reconcile(gc, cal_id, desired, prune=prune, now=now,
+                       tz=ZoneInfo(cfg.calendar_timezone))
 
     print(f"Calendar '{CALENDAR_SUMMARY}' synced: "
-          f"{created} created, {updated} updated, {unchanged} unchanged, "
-          f"{deleted} pruned ({skipped_undated} undated skipped).")
+          f"{c['created']} created, {c['updated']} updated, {c['unchanged']} unchanged, "
+          f"{c['deleted']} pruned ({skipped_undated} undated skipped).")
+
+
+def sync_user(cfg: Config, store: Store, user: dict, *,
+              prune: bool = True, include_past: bool = False) -> dict:
+    """Backend per-user sync: the user's decrypted refresh token + Web OAuth client, syncing
+    the deadlines for the sections they're enrolled in (the pooled set)."""
+    from .accounts import decrypt_token
+
+    enc = user.get("calendar_refresh_token")
+    if not enc:
+        return {"skipped": "no_refresh_token"}
+    if not cfg.google_web_client_id or not cfg.google_web_client_secret:
+        raise CalendarError("GOOGLE_WEB_CLIENT_ID / GOOGLE_WEB_CLIENT_SECRET are not set.")
+
+    refresh = decrypt_token(cfg, enc)
+    rows = [dict(r) for r in store.deadlines_for_user(user["id"])]
+    courses = {c["org_unit_id"]: (c["name"] or c["code"] or str(c["org_unit_id"]))
+               for c in store.courses_for_institution()}
+    now = _dt.datetime.now(_dt.timezone.utc)
+    desired, skipped = _desired_from_deadlines(
+        rows, courses, cfg, include_past=include_past, now=now)
+
+    with httpx.Client(timeout=30.0) as http:
+        gc = GoogleCalendar(http, cfg.google_web_client_id, cfg.google_web_client_secret,
+                            refresh)
+        cal_id = gc.ensure_calendar(cfg.calendar_timezone, user.get("calendar_id"))
+        if cal_id != user.get("calendar_id"):
+            store.set_user_calendar_id(user["id"], cal_id)
+        counts = _reconcile(gc, cal_id, desired, prune=prune, now=now,
+                            tz=ZoneInfo(cfg.calendar_timezone))
+    return {**counts, "skipped_undated": skipped}
 
 
 # --------------------------------------------------------------------------- CLI

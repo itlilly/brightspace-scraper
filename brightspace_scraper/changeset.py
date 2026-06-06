@@ -76,10 +76,13 @@ def process(
     run_id: int,
     *,
     full: bool = False,
+    prune: bool = True,
 ) -> Changeset:
     """Record courses + items, classify each item, and build the delta.
 
     full=True re-emits every item (ignores prior hashes) for a from-scratch export.
+    prune=False skips removal — required under multi-user pooling, where one user's
+    partial scrape must not evict items another user contributed (see store.mark_removed).
     """
     cs = Changeset(
         run_id=run_id,
@@ -108,7 +111,8 @@ def process(
         else:
             cs.unchanged_count += 1
 
-    scraped_ous = {c.org_unit_id for c in courses}
-    cs.removed = store.mark_removed(scraped_ous, run_id)
+    if prune:
+        scraped_ous = {c.org_unit_id for c in courses}
+        cs.removed = store.mark_removed(scraped_ous, run_id)
     store.commit()
     return cs

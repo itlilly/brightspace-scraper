@@ -28,12 +28,20 @@ class Config:
     cred_source: str        # "keychain" or "env" — provenance, not the secret
     base_url: str          # Brightspace host, e.g. https://online.mun.ca
     cas_base_url: str       # CAS host, e.g. https://login.mun.ca
-    data_dir: Path          # where the SQLite store + raw content live
+    data_dir: Path          # where raw content + report/changeset outputs live
+    database_url: str = ""  # libpq URL for Postgres (DATABASE_URL); store of record
+    institution: str = "mun"  # namespaces shared course data; one value per Brightspace host
     # Google Calendar sync (non-secret config; the OAuth refresh token lives in the
     # keychain, never here). client_secret for a "Desktop app" OAuth client is not
     # truly confidential, so it may sit in .env alongside the id.
     google_client_id: str | None = None
     google_client_secret: str | None = None
+    # Hosted-tier Google "Web application" OAuth client (multi-user) + token-at-rest key.
+    # Distinct from the Desktop client above, which the single-user CLI calendar sync uses.
+    google_web_client_id: str | None = None
+    google_web_client_secret: str | None = None
+    backend_base_url: str = "http://localhost:8000"   # builds the OAuth redirect URI
+    token_encryption_key: str | None = None           # Fernet key for refresh tokens
     default_due_time: str = "23:59"          # applied to date-only deadlines (flagged)
     calendar_timezone: str = "America/St_Johns"  # MUN is UTC-3:30 — mind the half hour
     oauth_port: int = 8765                   # loopback port for the OAuth consent flow
@@ -46,10 +54,6 @@ class Config:
     @property
     def cas_login_url(self) -> str:
         return f"{self.cas_base_url}/cas/login"
-
-    @property
-    def db_path(self) -> Path:
-        return self.data_dir / "brightspace.sqlite"
 
     @property
     def content_dir(self) -> Path:
@@ -74,6 +78,8 @@ def load_config(*, require_credentials: bool = True) -> Config:
     base_url = os.environ.get("BRIGHTSPACE_BASE_URL", "https://online.mun.ca").rstrip("/")
     cas_base_url = os.environ.get("CAS_BASE_URL", "https://login.mun.ca").rstrip("/")
     data_dir = Path(os.environ.get("DATA_DIR", "./data")).expanduser().resolve()
+    database_url = os.environ.get("DATABASE_URL", "postgresql://localhost/brightspace")
+    institution = os.environ.get("INSTITUTION", "mun").strip() or "mun"
 
     return Config(
         username=creds.username if creds else "",
@@ -82,8 +88,14 @@ def load_config(*, require_credentials: bool = True) -> Config:
         base_url=base_url,
         cas_base_url=cas_base_url,
         data_dir=data_dir,
+        database_url=database_url,
+        institution=institution,
         google_client_id=os.environ.get("GOOGLE_CLIENT_ID", "").strip() or None,
         google_client_secret=os.environ.get("GOOGLE_CLIENT_SECRET", "").strip() or None,
+        google_web_client_id=os.environ.get("GOOGLE_WEB_CLIENT_ID", "").strip() or None,
+        google_web_client_secret=os.environ.get("GOOGLE_WEB_CLIENT_SECRET", "").strip() or None,
+        backend_base_url=os.environ.get("BACKEND_BASE_URL", "http://localhost:8000").rstrip("/"),
+        token_encryption_key=os.environ.get("TOKEN_ENCRYPTION_KEY", "").strip() or None,
         default_due_time=os.environ.get("DEFAULT_DUE_TIME", "23:59").strip() or "23:59",
         calendar_timezone=(
             os.environ.get("CALENDAR_TIMEZONE", "America/St_Johns").strip()

@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 import datetime as _dt
-import sqlite3
 
 from .config import load_config
+from .store import Store
 from .util import parse_iso as _parse
 
 
@@ -18,12 +18,9 @@ def _fmt(dt: _dt.datetime | None) -> str:
     return dt.astimezone().strftime("%a %b %d, %Y  %H:%M") if dt else "—"
 
 
-def build_report(db_path, *, include_past: bool = False) -> str:
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    courses = {r["org_unit_id"]: r for r in conn.execute("SELECT * FROM courses")}
-    rows = conn.execute("SELECT * FROM deadlines").fetchall()
-    conn.close()
+def build_report(store: Store, *, include_past: bool = False) -> str:
+    courses = {r["org_unit_id"]: r for r in store.courses_for_institution()}
+    rows = store.deadlines_for_institution()
 
     now = _dt.datetime.now(_dt.timezone.utc)
 
@@ -82,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv if argv is not None else sys.argv[1:])
 
     cfg = load_config()
-    report = build_report(cfg.db_path, include_past=args.all)
+    store = Store(cfg.database_url, cfg.institution)
+    report = build_report(store, include_past=args.all)
+    store.close()
     out_path = cfg.data_dir / "deadlines.md"
     out_path.write_text(report, encoding="utf-8")
     print(report)

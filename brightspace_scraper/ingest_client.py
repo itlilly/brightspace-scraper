@@ -19,18 +19,23 @@ def push_harvest(
     courses: list[Course],
     items: list[HarvestItem],
     *,
+    token: str | None = None,
     full: bool = False,
     timeout: float = 300.0,
 ) -> dict:
     """POST the harvest to `<base_url>/ingest` and return the backend's JSON summary.
 
-    `timeout` is generous because the backend runs the LLM interpret pass synchronously.
+    `token` is the backend session bearer token (from the Google sign-in flow); the hosted
+    backend requires it. `timeout` is generous because the backend runs the LLM interpret
+    pass synchronously.
     """
     payload = {
         "full": full,
         "courses": [asdict(c) for c in courses],
         "items": [asdict(i) for i in items],
     }
-    resp = httpx.post(base_url.rstrip("/") + "/ingest", json=payload, timeout=timeout)
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = httpx.post(base_url.rstrip("/") + "/ingest", json=payload,
+                      headers=headers, timeout=timeout)
     resp.raise_for_status()
     return resp.json()

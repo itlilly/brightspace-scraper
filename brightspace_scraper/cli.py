@@ -42,6 +42,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--backend", default=os.environ.get("BACKEND_URL"),
                    help="POST the harvest to this backend (e.g. http://localhost:8000) "
                         "instead of storing + interpreting locally")
+    p.add_argument("--backend-token", default=os.environ.get("BACKEND_TOKEN"),
+                   help="backend session bearer token (from the Google sign-in flow); "
+                        "required by the hosted backend")
     return p.parse_args(argv)
 
 
@@ -97,17 +100,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.backend:
         print(f"\nPushing {len(courses)} course(s) + {len(all_items)} item(s) "
               f"to {args.backend} ...")
-        result = push_harvest(args.backend, courses, all_items, full=args.full)
+        result = push_harvest(args.backend, courses, all_items,
+                              token=args.backend_token, full=args.full)
         cs = result.get("changeset", {})
         dl = result.get("deadlines", {})
         print(f"backend run {cs.get('run_id')}: {cs.get('new')} new, "
-              f"{cs.get('changed')} changed, {cs.get('removed')} removed, "
-              f"{cs.get('unchanged')} unchanged")
+              f"{cs.get('changed')} changed, {cs.get('unchanged')} unchanged")
+        print(f"enrolled courses: {result.get('enrolled_course_ids')}")
         print(f"interpreted courses: {result.get('interpreted_course_ids')}")
         print(f"deadlines: {dl.get('total')} total, by confidence {dl.get('by_confidence')}")
         return 0
 
-    store = Store(cfg.db_path)
+    store = Store(cfg.database_url, cfg.institution)
     run_id = store.start_run()
     cs = process(store, courses, all_items, run_id, full=args.full)
     store.finish_run(run_id)
@@ -118,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"\n{cs.summary}")
     print(f"changeset -> {out_path}")
-    print(f"store     -> {cfg.db_path}")
+    print(f"store     -> {cfg.database_url}")
     print(f"content   -> {cfg.content_dir}")
     return 0
 
