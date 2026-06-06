@@ -435,6 +435,48 @@ def deadlines_to_dicts(deadlines: list[Deadline]) -> list[dict]:
     return [asdict(d) for d in deadlines]
 
 
+def build_interpreter(
+    backend: str | None = None,
+    url: str | None = None,
+    model: str | None = None,
+    stream: bool = False,
+) -> Interpreter:
+    """Pick an interpreter backend from explicit args / env (`LLM_BACKEND`).
+
+    Shared by the `interpret` CLI and the ingestion backend so both resolve the model
+    the same way. 'ollama' uses the native /api/chat (thinking off on Qwen3.x); anything
+    else uses the OpenAI-compatible endpoint.
+    """
+    backend = (backend or os.environ.get("LLM_BACKEND", "openai")).lower()
+    if backend == "ollama":
+        return OllamaInterpreter(base_url=url, model=model)
+    return LocalInterpreter(base_url=url, model=model, stream=stream)
+
+
+def interpret_courses(
+    store, course_ids: list[int], interp: Interpreter
+) -> list[Deadline]:
+    """Interpret each course's items into deadlines. Per-course failures are logged and
+    skipped (one bad course shouldn't sink the batch). No printing of model output — the
+    caller decides how to report. Shared by the backend's /ingest pipeline."""
+    import sys
+
+    items_by_course = store.get_items_for_courses(course_ids)
+    out: list[Deadline] = []
+    for oid in course_ids:
+        items = items_by_course.get(oid, [])
+        if not items:
+            continue
+        try:
+            out.extend(
+                interp.interpret_course(oid, store.course_name(oid) or str(oid), items)
+            )
+        except Exception as exc:
+            print(f"  ! interpret failed for {oid}: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+    return out
+
+
 # --------------------------------------------------------------------------- CLI
 def _target_courses(store, args) -> list[int]:
     if args.courses:

@@ -12,3 +12,7 @@ python-pptx>=0.6
 # Pillow is already pulled in by pdfplumber; pinned here since ocr.py uses it directly.
 pytesseract>=0.3.10
 Pillow>=10.0
+# Backend ingestion seam (server-side only — the CLI/client path doesn't import these).
+# Pydantic ships with FastAPI.
+fastapi>=0.136
+uvicorn[standard]>=0.49

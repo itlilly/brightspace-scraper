@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .auth import login
@@ -23,6 +24,7 @@ from .harvest.calendar import harvest_calendar
 from .harvest.content import harvest_content
 from .harvest.courses import harvest_courses
 from .harvest.quizzes import harvest_quizzes
+from .ingest_client import push_harvest
 from .models import HarvestItem
 from .store import Store
 
@@ -37,6 +39,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-content", action="store_true", help="skip content downloads")
     p.add_argument("--days-back", type=int, default=60)
     p.add_argument("--days-forward", type=int, default=240)
+    p.add_argument("--backend", default=os.environ.get("BACKEND_URL"),
+                   help="POST the harvest to this backend (e.g. http://localhost:8000) "
+                        "instead of storing + interpreting locally")
     return p.parse_args(argv)
 
 
@@ -86,6 +91,21 @@ def main(argv: list[str] | None = None) -> int:
         items = _harvest_course(bs, c.org_unit_id, args, cfg.content_dir)
         all_items.extend(items)
         print(f"  [{c.org_unit_id}] {c.code or c.name[:30]:30} -> {len(items)} items")
+
+    # Client/server seam: when a backend is configured, ship the harvest there (it owns
+    # change detection, interpretation, and persistence) instead of storing locally.
+    if args.backend:
+        print(f"\nPushing {len(courses)} course(s) + {len(all_items)} item(s) "
+              f"to {args.backend} ...")
+        result = push_harvest(args.backend, courses, all_items, full=args.full)
+        cs = result.get("changeset", {})
+        dl = result.get("deadlines", {})
+        print(f"backend run {cs.get('run_id')}: {cs.get('new')} new, "
+              f"{cs.get('changed')} changed, {cs.get('removed')} removed, "
+              f"{cs.get('unchanged')} unchanged")
+        print(f"interpreted courses: {result.get('interpreted_course_ids')}")
+        print(f"deadlines: {dl.get('total')} total, by confidence {dl.get('by_confidence')}")
+        return 0
 
     store = Store(cfg.db_path)
     run_id = store.start_run()
