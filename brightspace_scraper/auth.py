@@ -76,6 +76,24 @@ def login(config: Config, *, timeout: float = 30.0) -> httpx.Client:
         )
         resp.raise_for_status()
 
+        # Some accounts hit a post-auth interstitial — e.g. a password-expiry
+        # "Authenticated with Warnings" page — that authenticates successfully but waits
+        # for a confirmation (a form with `_eventId=proceed` + a fresh `execution` token)
+        # before CAS issues the service ticket. Follow it; bounded in case warnings stack.
+        for _ in range(3):
+            if client.cookies.get("d2lSessionVal"):
+                break
+            proceed_exec = _extract_hidden(resp.text, "execution")
+            if not (proceed_exec and _extract_hidden(resp.text, "_eventId") == "proceed"):
+                break
+            resp = client.post(
+                config.cas_login_url,
+                params={"service": config.cas_service},
+                data={"execution": proceed_exec, "_eventId": "proceed"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            resp.raise_for_status()
+
         # 3/4. Success means a Service Ticket was issued and D2L set its session
         # cookie. Detect both: a `ticket=` redirect in the chain AND the cookie.
         issued_ticket = any(

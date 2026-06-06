@@ -19,7 +19,11 @@ python -m venv .venv
 .venv/bin/python -m brightspace_scraper.credentials set
 .venv/bin/python -m brightspace_scraper.credentials status   # check what's resolved
 
-# the full pipeline (DATA_DIR + model default come from .env)
+# one-shot: harvest -> interpret -> report -> calendar sync (stops on first failure)
+.venv/bin/python -m brightspace_scraper.run              # full run; --dry-run previews the calendar
+.venv/bin/python -m brightspace_scraper.run --no-sync    # stop after deadlines.md
+
+# or run the stages individually (DATA_DIR + model default come from .env)
 .venv/bin/python -m brightspace_scraper.cli            # Stage 1: harvest current-term courses
 .venv/bin/python -m brightspace_scraper.interpret --all  # Stage 2: AI -> deadlines
 .venv/bin/python -m brightspace_scraper.report           # human-readable deadlines.md

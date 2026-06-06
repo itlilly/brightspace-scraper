@@ -327,7 +327,6 @@ def _plan(d: dict, cfg: Config) -> _Plan:
     """
     tz = ZoneInfo(cfg.calendar_timezone)
     raw = d["final_due_date"]
-    day_str = raw[:10]
     parsed = parse_iso(raw)
     # a "real" scheduled time = has a T and isn't a placeholder. The model encodes a
     # date-only / "due by end of day" deadline as midnight (T00:00:00Z) or end-of-day
@@ -338,6 +337,11 @@ def _plan(d: dict, cfg: Config) -> _Plan:
     has_real_time = bool(parsed) and "T" in raw and not placeholder
     local = ((parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)).astimezone(tz)
              if has_real_time else None)
+    # The intended calendar date: for a real clock time, the LOCAL date — a 23:59
+    # local deadline stored as next-day UTC must not land a day late. For a date-only
+    # placeholder (midnight / end-of-day UTC), keep raw[:10] as-is, since converting it
+    # to local would shift a date-only deadline to the prior day.
+    day_str = local.strftime("%Y-%m-%d") if has_real_time else raw[:10]
     is_event = (d.get("type") or "").lower() in EVENT_TYPES
 
     if is_event and has_real_time:
@@ -430,10 +434,17 @@ def _load_deadlines(db_path) -> tuple[list[dict], dict[int, str]]:
     return rows, courses
 
 
-def _event_start(ev: dict) -> _dt.datetime | None:
+def _event_start(ev: dict, tz: ZoneInfo) -> _dt.datetime | None:
     start = ev.get("start") or {}
     raw = start.get("dateTime") or start.get("date")
-    return parse_iso(raw) if raw else None
+    if not raw:
+        return None
+    parsed = parse_iso(raw)
+    if parsed is None:
+        return None
+    # all-day events carry a date-only `start.date` → naive; localize so it can be
+    # compared against the tz-aware `now` in the prune step.
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)
 
 
 def sync(cfg: Config, *, dry_run: bool = False, prune: bool = True,
@@ -504,7 +515,7 @@ def sync(cfg: Config, *, dry_run: bool = False, prune: bool = True,
                 for ev in existing:
                     if ev["id"] in desired:
                         continue
-                    start = _event_start(ev)
+                    start = _event_start(ev, ZoneInfo(cfg.calendar_timezone))
                     if start and start >= now:  # only prune future, never history
                         gc.delete_event(cal_id, ev["id"])
                         deleted += 1
