@@ -21,7 +21,7 @@ def push_harvest(
     *,
     token: str | None = None,
     full: bool = False,
-    timeout: float = 300.0,
+    timeout: float = 900.0,
 ) -> dict:
     """POST the harvest to `<base_url>/ingest` and return the backend's JSON summary.
 

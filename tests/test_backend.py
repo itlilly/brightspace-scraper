@@ -19,6 +19,7 @@ from cryptography.fernet import Fernet
 
 from brightspace_scraper import accounts, calendar_sync, changeset
 from brightspace_scraper.config import load_config
+from brightspace_scraper.interpret import Deadline, _dedupe, render_chunks
 from brightspace_scraper.models import Course, HarvestItem
 from brightspace_scraper.store import Store
 
@@ -296,6 +297,49 @@ def test_sync_user_guard_no_token():
     uid = s.upsert_user("pytest-NT", "nt@x.com", None)  # no refresh token
     assert calendar_sync.sync_user(CFG, s, s.get_user(uid)) == {"skipped": "no_refresh_token"}
     s.close()
+
+
+# --------------------------------------------------------------------------- interpret: chunking + dedupe
+def _dl(title, due, type="quiz", conf="high", item_id="x"):
+    return Deadline(org_unit_id=1, item_id=item_id, title=title, type=type,
+                    final_due_date=due, structured_due_date=None, confidence=conf,
+                    source_url=None, reasoning="")
+
+
+def test_dedupe_merges_same_day_title_containment():
+    ds = [
+        _dl("Quiz #2 Wed. June 10", "2026-06-10T00:00:00Z", item_id="a"),
+        _dl("Quiz 2", "2026-06-10T00:00:00Z", item_id="b"),        # same quiz, syllabus wording
+        _dl("Lab 1", "2026-06-10T00:00:00Z", type="lab", item_id="c"),  # same day, distinct
+        _dl("Quiz 3", "2026-06-26T00:00:00Z", item_id="d"),        # different day
+    ]
+    out = {(d.title, d.final_due_date[:10]) for d in _dedupe(ds)}
+    assert len(out) == 3, f"the two June-10 quizzes must merge, got {out}"
+    assert ("Quiz 2", "2026-06-10") in out, "keeps the shorter/cleaner title"
+    assert ("Lab 1", "2026-06-10") in out and ("Quiz 3", "2026-06-26") in out
+
+
+def test_dedupe_keeps_better_type_over_calendar_event():
+    ds = [
+        _dl("Assignment 1", "2026-06-10T00:00:00Z", type="calendar_event", item_id="cal"),
+        _dl("Assignment 1", "2026-06-10T00:00:00Z", type="assignment", item_id="asg"),
+    ]
+    out = _dedupe(ds)
+    assert len(out) == 1 and out[0].type == "assignment"
+
+
+def test_render_chunks_never_splits_an_item_and_drops_nothing():
+    # one oversized item (its own chunk) + several small ones
+    items = [{"id": f"assignment:1:{n}", "org_unit_id": 1, "type": "assignment",
+              "title": f"A{n}", "body_text": "x" * 1500} for n in range(5)]
+    items.append({"id": "content_file:1:big", "org_unit_id": 1, "type": "content_file",
+                  "title": "Course Outline", "body_text": "y" * 9000})  # high-value, > budget
+    chunks = render_chunks("C", items, budget=3000)
+    assert len(chunks) >= 2, "should split across multiple chunks"
+    # every item id appears in exactly one chunk (no split, nothing dropped)
+    for it in items:
+        hits = sum(it["id"] in c for c in chunks)
+        assert hits == 1, f"{it['id']} appeared in {hits} chunks (expected exactly 1)"
 
 
 # --------------------------------------------------------------------------- runner

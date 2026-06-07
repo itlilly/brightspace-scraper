@@ -37,12 +37,15 @@ _PER_ITEM_TEXT_CHARS = 2200
 _HIGH_VALUE_RE = re.compile(r"outline|syllab|assignment|\blab\b|project|problem set|schedule",
                             re.I)
 _HIGH_VALUE_TEXT_CHARS = 9000
-# Keep the whole bundle within the model's context window. Dense math/code tokenizes at
-# ~3 chars/token, so 24k chars blew past an 8k-token context (prompt + system + output) —
-# the bundle got truncated into garbage and the model emitted prose, not JSON. 16k chars
-# (~5k tokens worst-case) leaves room for the system prompt and the JSON output. High-value
-# items (outline/syllabus) are prioritized, so what's dropped first is lecture-slide noise.
-_COURSE_CHAR_BUDGET = 16000
+# Per-CHUNK budget. A course's items are split into bundles of ~this size and interpreted
+# one chunk at a time, then merged — instead of one big truncated bundle. Small models lose
+# recall when a single dated announcement is buried in a 16k-char firehose of 273 items
+# (proven: the same 4B model returned {"deadlines": []} for a whole course at 16k, but
+# nailed the quiz when handed just the 2k-char announcements). Smaller chunks = better
+# attention AND no truncation/data-loss (every item is seen across some chunk). ~6k chars
+# (~2k tokens) leaves ample room for the system prompt + JSON output. A single high-value
+# item (syllabus, up to _HIGH_VALUE_TEXT_CHARS) may exceed this and gets its own chunk.
+_CHUNK_CHAR_BUDGET = 3000
 
 # Words that signal a document likely carries a deadline (boost into the budget) ...
 _DEADLINE_HINTS = ("due", "deadline", "submit", "submission", "assignment", "lab",
@@ -158,17 +161,18 @@ def ocr_pass(items: list[dict]) -> int:
     return done
 
 
-def render_bundle(course_name: str, items: list[dict]) -> str:
-    """Compact, token-bounded rendering of a course's items for the model."""
-    lines: list[str] = [f"COURSE: {course_name}", ""]
-    budget = _COURSE_CHAR_BUDGET
-    dropped = 0
+def _item_blocks(items: list[dict]) -> list[str]:
+    """Render a course's deadline-bearing items to ordered, atomic text blocks.
 
+    High-value / most-relevant items first (so the most useful content leads each chunk).
+    No budget cap here — packing into chunks happens in `render_chunks`; nothing is dropped.
+    """
     def sort_key(i: dict):
         t = _TIER.get(i.get("type"), 9)
         rel = -_content_relevance(i) if i.get("type") in ("content_file", "content_page") else 0
         return (t, rel)
 
+    blocks: list[str] = []
     for it in sorted(items, key=sort_key):
         if it.get("type") not in _DEADLINE_TYPES:
             continue
@@ -176,21 +180,39 @@ def render_bundle(course_name: str, items: list[dict]) -> str:
         limit = (_HIGH_VALUE_TEXT_CHARS
                  if _HIGH_VALUE_RE.search(it.get("title") or "")
                  else _PER_ITEM_TEXT_CHARS)
-        block = (
+        blocks.append(
             f"- item_id: {it.get('id')}\n"
             f"  type: {it.get('type')}\n"
             f"  title: {it.get('title')}\n"
             f"  STRUCTURED_DUE_DATE: {it.get('structured_due_date') or 'none'}\n"
             f"  text: {_truncate(text, limit)}\n"
         )
-        if len(block) > budget:
-            dropped += 1
-            continue
-        lines.append(block)
-        budget -= len(block)
-    if dropped:
-        lines.append(f"\n[note: {dropped} item(s) omitted to fit context budget]")
-    return "\n".join(lines)
+    return blocks
+
+
+def render_chunks(course_name: str, items: list[dict], *,
+                  budget: int = _CHUNK_CHAR_BUDGET) -> list[str]:
+    """Split a course's items into model-sized bundles ("chunks").
+
+    Small models lose recall when one dated item is buried in a huge bundle, so instead of
+    one big (truncated) bundle we pack the ordered item blocks into ~`budget`-char chunks and
+    interpret each. Two guarantees: every item is seen across some chunk (no truncation/data
+    loss), and **a single item is never split** — a block bigger than `budget` simply gets its
+    own chunk. The caller merges + dedups results across chunks.
+    """
+    header = f"COURSE: {course_name}"
+    chunks: list[str] = []
+    cur: list[str] = []
+    size = 0
+    for block in _item_blocks(items):
+        if cur and size + len(block) > budget:
+            chunks.append(header + "\n\n" + "\n".join(cur))
+            cur, size = [], 0
+        cur.append(block)
+        size += len(block)
+    if cur:
+        chunks.append(header + "\n\n" + "\n".join(cur))
+    return chunks or [header + "\n\n(no deadline-bearing items)"]
 
 
 def _parse_model_json(raw: str) -> dict:
@@ -291,10 +313,12 @@ class Interpreter(ABC):
         self, org_unit_id: int, course_name: str, items: list[dict]
     ) -> list[Deadline]:
         ocr_pass(items)  # interpreter-side OCR of any scanned/image items
-        bundle = render_bundle(course_name, items)
-        raw = self._complete(SYSTEM_PROMPT, bundle)
-        parsed = _parse_model_json(raw)
-        return _build_deadlines(org_unit_id, parsed.get("deadlines", []), items)
+        # Interpret each chunk separately so no item is buried in a giant bundle, then merge.
+        raw_deadlines: list[dict] = []
+        for chunk in render_chunks(course_name, items):
+            parsed = _parse_model_json(self._complete(SYSTEM_PROMPT, chunk))
+            raw_deadlines.extend(parsed.get("deadlines", []))
+        return _build_deadlines(org_unit_id, raw_deadlines, items)
 
 
 class LocalInterpreter(Interpreter):
@@ -406,29 +430,50 @@ class OllamaInterpreter(Interpreter):
         return resp.json().get("message", {}).get("content", "")
 
 
-def _dedupe(deadlines: list[Deadline]) -> list[Deadline]:
-    """Collapse duplicates — e.g. a calendar event mirroring an assignment.
+def _norm_title(title: str | None) -> str:
+    """Lowercase, alphanumerics only — the comparison key for titles."""
+    return "".join(ch for ch in (title or "").lower() if ch.isalnum())
 
-    Keyed by (normalized title, due-date day). Prefer the assignment/quiz source over a
-    calendar_event, and higher confidence, when merging.
+
+def _dedupe(deadlines: list[Deadline]) -> list[Deadline]:
+    """Collapse duplicates of the same real deadline.
+
+    Two deadlines on the **same due-day** are merged when one normalized title *contains*
+    the other — so a calendar event mirroring an assignment, or the same quiz described two
+    ways across chunks ("Quiz 2" from the syllabus vs "Quiz #2 Wed. June 10" from an
+    announcement), collapse to one. Containment (not exact match) is what catches the
+    differently-worded duplicates chunked interpretation surfaces. Within a day, collisions
+    between genuinely-distinct deadlines are very unlikely.
+
+    Of a duplicate set we keep the best: lower `rank` (assignment/quiz beats calendar_event),
+    then higher confidence, then the shorter (cleaner) title.
     """
     rank = {"assignment": 0, "quiz": 1, "exam": 1, "lab": 1, "project": 1,
             "calendar_event": 5, "other": 6}
     conf_rank = {"high": 0, "medium": 1, "low": 2}
-    best: dict[tuple, Deadline] = {}
+
+    def pref(d: Deadline) -> tuple:
+        # sort so the one we want to KEEP comes first within a day group
+        return (rank.get(d.type, 6), conf_rank.get(d.confidence, 3),
+                len(_norm_title(d.title)))
+
+    by_day: dict[str, list[Deadline]] = {}
     for d in deadlines:
-        title_key = "".join(ch for ch in (d.title or "").lower() if ch.isalnum())
-        day = (d.final_due_date or "")[:10]
-        key = (title_key, day)
-        cur = best.get(key)
-        if cur is None:
-            best[key] = d
-            continue
-        # keep the better-typed / more-confident one
-        if (rank.get(d.type, 6), conf_rank.get(d.confidence, 3)) < \
-           (rank.get(cur.type, 6), conf_rank.get(cur.confidence, 3)):
-            best[key] = d
-    return list(best.values())
+        by_day.setdefault((d.final_due_date or "")[:10], []).append(d)
+
+    result: list[Deadline] = []
+    for group in by_day.values():
+        kept: list[Deadline] = []
+        for d in sorted(group, key=pref):
+            dk = _norm_title(d.title)
+            if dk and any(
+                _norm_title(k.title) in dk or dk in _norm_title(k.title)
+                for k in kept
+            ):
+                continue  # duplicate of an already-kept (better) deadline this day
+            kept.append(d)
+        result.extend(kept)
+    return result
 
 
 def deadlines_to_dicts(deadlines: list[Deadline]) -> list[dict]:
@@ -522,14 +567,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         total = 0
+        total_chunks = 0
         for oid in ids:
             items = items_by_course.get(oid, [])
             ocr_pass(items)  # so token sizing reflects OCR'd text too
-            bundle = render_bundle(store.course_name(oid) or str(oid), items)
-            total += len(bundle)
+            chunks = render_chunks(store.course_name(oid) or str(oid), items)
+            chars = sum(len(c) for c in chunks)
+            total += chars
+            total_chunks += len(chunks)
             print(f"  [{oid}] {store.course_name(oid) or '':40.40} "
-                  f"items={len(items):3} bundle={len(bundle):6} chars (~{len(bundle)//4} tok)")
-        print(f"\nDRY RUN — no model called. Total ~{total//4} tokens across courses.")
+                  f"items={len(items):3} chunks={len(chunks):2} {chars:6} chars "
+                  f"(~{chars//4} tok)")
+        print(f"\nDRY RUN — no model called. {total_chunks} chunk(s) / "
+              f"~{total//4} tokens across courses (1 model call per chunk).")
         store.close()
         return 0
 
